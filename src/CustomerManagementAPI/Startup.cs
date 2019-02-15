@@ -15,50 +15,35 @@ using Pitstop.CustomerManagementAPI.Commands;
 using Microsoft.AspNetCore.Mvc;
 using Serilog;
 using Microsoft.Extensions.HealthChecks;
-using Pitstop.Infrastructure.ServiceDiscovery;
-using Consul;
 
 namespace Pitstop.CustomerManagementAPI
 {
     public class Startup
     {
-        public Startup(IHostingEnvironment env)
-        {
-            var builder = new ConfigurationBuilder()
-                .SetBasePath(env.ContentRootPath)
-                .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
-                .AddJsonFile($"appsettings.{env.EnvironmentName}.json", optional: true)
-                .AddEnvironmentVariables();
-            Configuration = builder.Build();
-        }
+        private IConfiguration _configuration;
 
-        public IConfigurationRoot Configuration { get; }
+        public Startup(IConfiguration configuration)
+        {
+            _configuration = configuration;
+        }
 
         // This method gets called by the runtime. Use this method to add services to the container.
         public void ConfigureServices(IServiceCollection services)
         {
             // add DBContext classes
-            var sqlConnectionString = Configuration.GetConnectionString("CustomerManagementCN");
+            var sqlConnectionString = _configuration.GetConnectionString("CustomerManagementCN");
             services.AddDbContext<CustomerManagementDBContext>(options => options.UseSqlServer(sqlConnectionString));
 
             // add messagepublisher classes
-            var configSection = Configuration.GetSection("RabbitMQ");
+            var configSection = _configuration.GetSection("RabbitMQ");
             string host = configSection["Host"];
             string userName = configSection["UserName"];
             string password = configSection["Password"];
             services.AddTransient<IMessagePublisher>((sp) => new RabbitMQMessagePublisher(host, userName, password, "Pitstop"));
 
-            // add consul
-            services.Configure<ConsulConfig>(Configuration.GetSection("consulConfig"));
-            services.AddSingleton<IConsulClient, ConsulClient>(p => new ConsulClient(consulConfig =>
-            {
-                var address = Configuration["consulConfig:address"];
-                consulConfig.Address = new Uri(address);
-            }));  
-
             // Add framework services.
             services.AddMvc()
-                .SetCompatibilityVersion(CompatibilityVersion.Version_2_1);
+                .SetCompatibilityVersion(CompatibilityVersion.Version_2_2);
 
             // Register the Swagger generator, defining one or more Swagger documents
             services.AddSwaggerGen(c =>
@@ -69,7 +54,7 @@ namespace Pitstop.CustomerManagementAPI
             services.AddHealthChecks(checks =>
             {
                 checks.WithDefaultCacheDuration(TimeSpan.FromSeconds(1));
-                checks.AddSqlCheck("CustomerManagementCN", Configuration.GetConnectionString("CustomerManagementCN"));
+                checks.AddSqlCheck("CustomerManagementCN", _configuration.GetConnectionString("CustomerManagementCN"));
             });
         }
 
@@ -77,7 +62,8 @@ namespace Pitstop.CustomerManagementAPI
         public void Configure(IApplicationBuilder app, IHostingEnvironment env, IApplicationLifetime lifetime, CustomerManagementDBContext dbContext)
         {
             Log.Logger = new LoggerConfiguration()
-                .ReadFrom.Configuration(Configuration)
+                .ReadFrom.Configuration(_configuration)
+                .Enrich.WithMachineName()
                 .CreateLogger();
 
             app.UseMvc();
@@ -95,8 +81,11 @@ namespace Pitstop.CustomerManagementAPI
                 c.SwaggerEndpoint("/swagger/v1/swagger.json", "CustomerManagement API - v1");
             });
 
-            // register service in Consul
-            app.RegisterWithConsul(lifetime);
+            // auto migrate db
+            using (var scope = app.ApplicationServices.GetRequiredService<IServiceScopeFactory>().CreateScope())
+            {
+                scope.ServiceProvider.GetService<CustomerManagementDBContext>().MigrateDB();
+            }
         }
 
         private void SetupAutoMapper()
@@ -106,9 +95,9 @@ namespace Pitstop.CustomerManagementAPI
             {
                 cfg.CreateMap<RegisterCustomer, Customer>();
                 cfg.CreateMap<Customer, RegisterCustomer>()
-                    .ForCtorParam("messageId", opt => opt.ResolveUsing(c => Guid.NewGuid()));
+                    .ForCtorParam("messageId", opt => opt.MapFrom(c => Guid.NewGuid()));
                 cfg.CreateMap<RegisterCustomer, CustomerRegistered>()
-                    .ForCtorParam("messageId", opt => opt.ResolveUsing(c => Guid.NewGuid()));
+                    .ForCtorParam("messageId", opt => opt.MapFrom(c => Guid.NewGuid()));
             });
         }
     }
